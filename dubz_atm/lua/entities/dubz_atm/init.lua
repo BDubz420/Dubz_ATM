@@ -8,156 +8,218 @@ util.AddNetworkString("RequestBalance")
 util.AddNetworkString("UpdateBalance")
 util.AddNetworkString("ATM_Deposit")
 util.AddNetworkString("ATM_Withdraw")
-util.AddNetworkString("ATM_ToggleInterest")
 
--- Initialize entity
-function ENT:Initialize()
-    self:SetModel(self.Model)
-    self:SetUseType( SIMPLE_USE )
-    self:PhysicsInit( SOLID_VPHYSICS )
-    self:SetMoveType( MOVETYPE_VPHYSICS )
-    self:SetSolid( SOLID_VPHYSICS )
+function ENT:Hackable()
+    return true
 end
 
--- Define the behavior when a player interacts with the ATM
-function ENT:Use(activator, caller)
-    -- Check if the activator is a player
+-- =========================
+-- 📁 FILE STORAGE SETUP
+-- =========================
+if not file.Exists("dubz_atm", "DATA") then
+    file.CreateDir("dubz_atm")
+end
+
+local function GetPlayerFile(ply)
+    return "dubz_atm/" .. ply:SteamID64() .. ".txt"
+end
+
+local function SaveAccount(ply, data)
+    local path = GetPlayerFile(ply)
+    file.Write(path, util.TableToJSON(data, true))
+end
+
+-- 🔥 SAFE LOAD + MIGRATION
+local function LoadAccount(ply)
+    local path = GetPlayerFile(ply)
+
+    if file.Exists(path, "DATA") then
+        local data = file.Read(path, "DATA")
+        local tbl = util.JSONToTable(data or "")
+        return tbl or { balance = 0, history = {} }
+    end
+
+    -- MIGRATE FROM PDATA
+    local pdataBalance = tonumber(ply:GetPData("bank_balance") or 0) or 0
+
+    local newData = {
+        balance = pdataBalance,
+        history = {}
+    }
+
+    file.Write(path, util.TableToJSON(newData, true))
+
+    print("[Dubz ATM] Migrated " .. ply:Nick() .. " ($" .. pdataBalance .. ")")
+
+    return newData
+end
+
+-- =========================
+-- 🧾 TRANSACTION LOGGER
+-- =========================
+local function AddTransaction(ply, acc, data)
+    acc.history = acc.history or {}
+
+    table.insert(acc.history, 1, {
+        type = data.type,
+        amount = data.amount,
+        rate = data.rate,
+        time = os.time()
+    })
+
+    if #acc.history > 25 then
+        table.remove(acc.history)
+    end
+end
+
+-- =========================
+-- ENTITY
+-- =========================
+function ENT:Initialize()
+    self:SetModel(self.Model)
+    self:SetUseType(SIMPLE_USE)
+    self:PhysicsInit(SOLID_VPHYSICS)
+    self:SetMoveType(MOVETYPE_VPHYSICS)
+    self:SetSolid(SOLID_VPHYSICS)
+end
+
+function ENT:Use(activator)
     if activator:IsPlayer() then
         net.Start("OpenATMMenu")
         net.WriteEntity(activator)
-        net.Send(activator)  -- Open the ATM menu for the player who interacted with it
+        net.Send(activator)
     end
 end
 
--- Initialize player bank data
-hook.Add("PlayerInitialSpawn", "dubz_ATM_InitializeBank", function(ply)
-    if not ply:GetPData("bank_balance") then
-        ply:SetPData("bank_balance", 0)
-    end
+-- =========================
+-- LOAD ACCOUNT
+-- =========================
+hook.Add("PlayerInitialSpawn", "dubz_ATM_LoadAccount", function(ply)
+    LoadAccount(ply)
 end)
 
--- Request balance from server
-net.Receive("RequestBalance", function(len, ply)
-    local balance = tonumber(ply:GetPData("bank_balance"))
+-- =========================
+-- BALANCE REQUEST
+-- =========================
+net.Receive("RequestBalance", function(_, ply)
+    local acc = LoadAccount(ply)
+
     net.Start("UpdateBalance")
-    net.WriteInt(balance, 32)
+    net.WriteInt(acc.balance or 0, 32)
     net.WriteBool(dubz.atm["dubz_atm"].interestEnabled)
+    net.WriteTable(acc.history or {})
     net.Send(ply)
 end)
 
--- Deposit command (server-side)
-net.Receive("ATM_Deposit", function(len, ply)
+-- =========================
+-- DEPOSIT
+-- =========================
+net.Receive("ATM_Deposit", function(_, ply)
     local amount = net.ReadInt(32)
 
-    -- Check if the player has enough money to deposit
-    if IsValid(ply) and amount and amount > 0 then
+    if amount and amount > 0 then
+        local money = ply:getDarkRPVar("money")
 
+        if money >= amount then
+            local acc = LoadAccount(ply)
 
-        local plyMoney = ply:getDarkRPVar("money")  -- Get player's balance
-        if plyMoney >= amount then
-            -- Deduct money from the player's wallet
-            ply:addMoney(-amount)  -- Subtract the deposit amount
-            -- Optionally, store this amount in the ATM (e.g., in a variable)
+            ply:addMoney(-amount)
 
-            -- ATMBalance = ATMBalance + amount  -- Update the ATM balance
-            local currentBalance = tonumber(ply:GetPData("bank_balance"))
-            ply:SetPData("bank_balance", currentBalance + amount)
+            acc.balance = (acc.balance or 0) + amount
 
-            -- Confirm the deposit
-            ply:ChatPrint("You have deposited $" .. amount)
+            AddTransaction(ply, acc, {
+                type = "deposit",
+                amount = amount
+            })
+
+            SaveAccount(ply, acc)
+
+            ply:ChatPrint("Deposited $" .. amount)
         else
-            -- Notify the player about insufficient funds
-            ply:ChatPrint("You don't have enough money to deposit!")
+            ply:ChatPrint("Not enough money!")
         end
-    else
-        ply:ChatPrint("Invalid deposit amount!")
     end
 end)
 
--- Withdraw command (server-side)
-net.Receive("ATM_Withdraw", function(len, ply)
+-- =========================
+-- WITHDRAW
+-- =========================
+net.Receive("ATM_Withdraw", function(_, ply)
     local amount = net.ReadInt(32)
+
     if amount and amount > 0 then
-        local currentBalance = tonumber(ply:GetPData("bank_balance"))
-        if currentBalance >= amount then
-            ply:SetPData("bank_balance", currentBalance - amount)
-            ply:addMoney(amount)  -- Adds money to the player's wallet
+        local acc = LoadAccount(ply)
+
+        if (acc.balance or 0) >= amount then
+            acc.balance = acc.balance - amount
+
+            AddTransaction(ply, acc, {
+                type = "withdraw",
+                amount = amount
+            })
+
+            SaveAccount(ply, acc)
+
+            ply:addMoney(amount)
             ply:ChatPrint("Withdrew $" .. amount)
         else
             ply:ChatPrint("Insufficient funds!")
         end
-    else
-        ply:ChatPrint("Invalid withdrawal amount!")
     end
 end)
 
--- Toggle interest system
-net.Receive("ATM_ToggleInterest", function(len, ply)
-    local currentState = dubz.atm["dubz_atm"].interestEnabled
-    RunConsoleCommand("atm_interest_enabled", not currentState)
-end)
+-- =========================
+-- INTEREST SYSTEM
+-- =========================
+local interestTime = dubz.atm["dubz_atm"].interestTime * 60
 
-local interestTime = dubz.atm["dubz_atm"].interestTime * 60  -- Convert minutes to seconds
--- Apply interest every configured time interval
 timer.Create("ATM_InterestTimer", interestTime, 0, function()
     for _, ply in ipairs(player.GetAll()) do
-        if ply:GetPData("bank_balance") then
-            local balance = tonumber(ply:GetPData("bank_balance"))
-            -- Ensure the interest system is enabled
-            if dubz.atm["dubz_atm"].interestEnabled then
-                if balance <= 0 then
-                    ply:ChatPrint("No Interest was applied! Your balance is: $" .. balance)
-                else
+        local acc = LoadAccount(ply)
+        local balance = acc.balance or 0
 
-                    local interest = math.Round(balance * dubz.atm["dubz_atm"].interestRate)  -- Calculate interest
-                    ply:SetPData("bank_balance", balance + interest)  -- Apply the interest to the bank balance
-                    ply:ChatPrint("Interest applied! New balance: $" .. math.Round(balance + interest, 2))
-                end
-            end
+        if dubz.atm["dubz_atm"].interestEnabled and balance > 0 then
+            local minRate = dubz.atm["dubz_atm"].interestMin
+            local maxRate = dubz.atm["dubz_atm"].interestMax
+
+            local rate = math.Rand(minRate, maxRate)
+            local interest = math.Round(balance * rate)
+
+            acc.balance = balance + interest
+
+            AddTransaction(ply, acc, {
+                type = "interest",
+                amount = interest,
+                rate = rate
+            })
+
+            SaveAccount(ply, acc)
+
+            ply:SetNWFloat("ATM_LastInterestRate", rate)
+
+            ply:ChatPrint("Interest (" .. math.Round(rate * 100, 2) .. "%): $" .. interest)
         end
     end
 end)
 
--- Command to clear a player's bank balance by partial name
-concommand.Add("clear_bank_balance", function(ply, cmd, args)
-    if not ply:IsAdmin() then  -- Check if the player is an admin
-        ply:ChatPrint("You do not have permission to use this command.")
-        return
-    end
+-- =========================
+-- ADMIN COMMAND
+-- =========================
+concommand.Add("clear_bank_balance", function(ply, _, args)
+    if not ply:IsAdmin() then return end
 
-    local partialName = args[1]  -- Get the partial name from the arguments
+    local name = args[1]
+    if not name then return end
 
-    if not partialName then
-        ply:ChatPrint("You must provide a player's partial name.")
-        return
-    end
-
-    local matchingPlayers = {}
-
-    -- Loop through all players and check if their name contains the partial name
     for _, target in ipairs(player.GetAll()) do
-        if string.find(string.lower(target:Nick()), string.lower(partialName)) then
-            table.insert(matchingPlayers, target)
+        if string.find(string.lower(target:Nick()), string.lower(name)) then
+            local acc = LoadAccount(target)
+            acc.balance = 0
+            SaveAccount(target, acc)
+
+            ply:ChatPrint("Cleared " .. target:Nick())
+            target:ChatPrint("Your balance was cleared.")
+            return
         end
     end
-
-    -- Check if no player was found
-    if #matchingPlayers == 0 then
-        ply:ChatPrint("No players found with the name '" .. partialName .. "'.")
-        return
-    end
-
-    -- If more than one player is found, notify the admin and don't proceed
-    if #matchingPlayers > 1 then
-        ply:ChatPrint("Multiple players found with the name '" .. partialName .. "'. Please be more specific.")
-        return
-    end
-
-    -- Clear the bank balance of the found player
-    local targetPlayer = matchingPlayers[1]
-    targetPlayer:SetPData("bank_balance", 0)
-
-    -- Notify the admin and the target player
-    ply:ChatPrint("Cleared " .. targetPlayer:Nick() .. "'s bank balance.")
-    targetPlayer:ChatPrint("Your bank balance has been cleared by an admin.")
 end)
